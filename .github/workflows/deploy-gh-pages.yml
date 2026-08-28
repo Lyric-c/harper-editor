@@ -28,6 +28,15 @@ on:
           as a self-contained sub-site at /editor/ on GitHub Pages.
         required: false
         default: ''
+      base:
+        description: >-
+          Sub-path the built site will be served from. Leave blank for the
+          site root (https://example.com/), or set to e.g. "editor" so that
+          every asset is referenced as /editor/... (the site is then served
+          at https://example.com/editor/). Forward slashes are allowed:
+          "tools/harper" => https://example.com/tools/harper/.
+        required: false
+        default: ''
       commit_message:
         description: 'Commit message for the gh-pages branch'
         required: false
@@ -77,6 +86,8 @@ jobs:
         run: pnpm install --frozen-lockfile=false
 
       - name: Build
+        env:
+          BASE: ${{ inputs.base }}
         run: pnpm run build
 
       - name: Normalise subpath input
@@ -135,6 +146,7 @@ jobs:
           # Sidecar file for the deploy job to read.
           echo "deploy_dir_name=$DEPLOY_DIR_NAME" > /tmp/site/.deploy-info
           echo "subpath_input=${{ inputs.subpath }}" >> /tmp/site/.deploy-info
+          echo "base_input=${{ inputs.base }}" >> /tmp/site/.deploy-info
           echo "deployed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"  >> /tmp/site/.deploy-info
           echo "source_sha=${{ github.sha }}"              >> /tmp/site/.deploy-info
           echo "source_ref=${{ github.ref }}"              >> /tmp/site/.deploy-info
@@ -223,7 +235,7 @@ jobs:
 
           # Update (or create) the gh-pages README that lists every deployed
           # subpath and when it was last refreshed.
-          export deploy_dir_name subpath_input source_sha source_ref deployed_at
+          export deploy_dir_name subpath_input source_sha source_ref deployed_at base_input
           python3 - <<'PY'
           import os, datetime, pathlib
           deploy_dir = os.environ['deploy_dir_name']
@@ -246,7 +258,8 @@ jobs:
           else:
               path_label = '/' + deploy_dir + '/'
               sub_label = 'subpath: ' + (subpath_input or deploy_dir)
-          new_row = f'| {path_label} | {sub_label} | {ts_str} | `{source_sha[:7]}` |'
+          base_label = ('/' + base_input) if base_input else '(root)'
+          new_row = f'| {path_label} | {sub_label} | {base_label} | {ts_str} | `{source_sha[:7]}` |'
 
           # Find existing table, if any.
           text = readme.read_text() if readme.exists() else ''
@@ -276,8 +289,8 @@ jobs:
                   'Each row below is one SvelteKit route that has been deployed.\n\n'
               )
               header = (
-                  '| Path | Source subpath | Last deployed | Source commit |\n'
-                  '| --- | --- | --- | --- |\n'
+                  '| Path | Source subpath | Built with base | Last deployed | Source commit |\n'
+                  '| --- | --- | --- | --- | --- |\n'
               )
               text = preamble + marker + '\n' + header + new_row + '\n' + end_marker + '\n'
           readme.write_text(text)
