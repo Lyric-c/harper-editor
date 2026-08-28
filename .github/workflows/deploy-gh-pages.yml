@@ -4,12 +4,13 @@ name: Deploy to GitHub Pages
 # `gh-pages` branch, which GitHub Pages can serve at:
 #   https://<owner>.github.io/<repo>/
 #
-# Two trigger modes:
-#   1. Manual: Actions tab → "Deploy to GitHub Pages" → Run workflow.
-#   2. Automatic on push to main: enabled by setting the repository
-#      variable AUTO_DEPLOY=true in Settings → Secrets and variables →
-#      Actions → Variables. (Off by default so a stray commit never
-#      silently republishes your site.)
+# Trigger: manual only. Actions tab → "Deploy to GitHub Pages" → Run workflow.
+#
+# Inputs:
+#   subpath         - which SvelteKit route to deploy, e.g. "" (default, the
+#                     whole build/) or "editor" (just build/editor/). This
+#                     becomes the directory name on the gh-pages branch.
+#   commit_message  - optional override for the gh-pages commit message.
 #
 # Prerequisites (one-time, in repository Settings → Pages):
 #   - Source: "Deploy from a branch"
@@ -20,6 +21,13 @@ name: Deploy to GitHub Pages
 on:
   workflow_dispatch:
     inputs:
+      subpath:
+        description: >-
+          Which route to deploy. Leave blank to deploy the whole site
+          (build/), or set to e.g. "editor" to deploy only build/editor/
+          as a self-contained sub-site at /editor/ on GitHub Pages.
+        required: false
+        default: ''
       commit_message:
         description: 'Commit message for the gh-pages branch'
         required: false
@@ -71,29 +79,70 @@ jobs:
       - name: Build
         run: pnpm run build
 
+      - name: Normalise subpath input
+        id: subpath
+        run: |
+          set -euo pipefail
+          # Trim whitespace and leading/trailing slashes.
+          RAW="${{ inputs.subpath }}"
+          SUB=$(printf '%s' "$RAW" | sed -E 's#^/+##; s#/+$##')
+          if [ -z "$SUB" ]; then
+            SUBDIR=""
+            ARTIFACT="site-root"
+          else
+            SUBDIR="$SUB"
+            ARTIFACT="site-$(printf '%s' "$SUB" | tr '/' '-')"
+          fi
+          echo "subpath=$SUB"      >> "$GITHUB_OUTPUT"
+          echo "subdir=$SUBDIR"    >> "$GITHUB_OUTPUT"
+          echo "artifact=$ARTIFACT" >> "$GITHUB_OUTPUT"
+          echo "::notice::Deploying subpath='$SUBDIR' (artifact: $ARTIFACT)"
+
       - name: Verify build output
         run: |
           set -euo pipefail
-          test -f build/index.html          || { echo "::error::build/index.html missing"; exit 1; }
-          test -d build/_app                || { echo "::error::build/_app/ missing"; exit 1; }
-          WASM=$(ls build/_app/immutable/assets/*.wasm 2>/dev/null | head -1 || true)
+          if [ -z "${{ steps.subpath.outputs.subdir }}" ]; then
+            BASE=build
+          else
+            BASE="build/${{ steps.subpath.outputs.subdir }}"
+          fi
+          test -f "$BASE/index.html" || { echo "::error::$BASE/index.html missing"; exit 1; }
+          test -d "$BASE/_app"       || { echo "::error::$BASE/_app/ missing"; exit 1; }
+          WASM=$(ls "$BASE/_app/immutable/assets/"*.wasm 2>/dev/null | head -1 || true)
           if [ -z "$WASM" ]; then
-            echo "::error::no .wasm in build/_app/immutable/assets/"
+            echo "::error::no .wasm in $BASE/_app/immutable/assets/"
             exit 1
           fi
-          echo "OK: build/index.html + build/_app/ + WASM asset present"
+          echo "OK: $BASE/index.html + $BASE/_app/ + WASM asset present"
 
       - name: Prepare deploy artifact
         run: |
-          # Keep a copy of the built site so the deploy job (a different
-          # runner) can publish it without rebuilding.
-          cp -a build /tmp/site
-          echo "deployed at $(date -u +%Y-%m-%dT%H:%M:%SZ)" > /tmp/site/.deploy-info
+          set -euo pipefail
+          SUB="${{ steps.subpath.outputs.subdir }}"
+          rm -rf /tmp/site
+          mkdir -p /tmp/site
+          if [ -z "$SUB" ]; then
+            # Whole site: build/* → gh-pages/*
+            cp -a build/. /tmp/site/
+            DEPLOY_DIR_NAME="(root)"
+          else
+            # Subpath: build/<sub>/. → gh-pages/<sub>/
+            # https://<owner>.github.io/<repo>/<sub>/index.html
+            mkdir -p "/tmp/site/$SUB"
+            cp -a "build/$SUB/." "/tmp/site/$SUB/"
+            DEPLOY_DIR_NAME="$SUB"
+          fi
+          # Sidecar file for the deploy job to read.
+          echo "deploy_dir_name=$DEPLOY_DIR_NAME" > /tmp/site/.deploy-info
+          echo "subpath_input=${{ inputs.subpath }}" >> /tmp/site/.deploy-info
+          echo "deployed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"  >> /tmp/site/.deploy-info
+          echo "source_sha=${{ github.sha }}"              >> /tmp/site/.deploy-info
+          echo "source_ref=${{ github.ref }}"              >> /tmp/site/.deploy-info
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: site
+          name: ${{ steps.subpath.outputs.artifact }}
           path: /tmp/site
           retention-days: 7
           if-no-files-found: error
@@ -109,40 +158,149 @@ jobs:
       - name: Check out this repository
         uses: actions/checkout@v4
         with:
+          # We need history on the gh-pages branch so we can merge the new
+          # subpath in without clobbering previously-deployed subpaths.
           fetch-depth: 0
 
       - name: Download artifact
         uses: actions/download-artifact@v4
         with:
-          name: site
+          name: ${{ inputs.subpath && format('site-{0}', inputs.subpath) || 'site-root' }}
           path: /tmp/site
 
-      - name: Push build/ to gh-pages branch
+      - name: Merge into gh-pages
         run: |
           set -euo pipefail
-          # We push the contents of build/ (not the build/ directory itself),
-          # because that is what GitHub Pages serves at the project root.
+          # Load the sidecar file written by the build job.
+          # shellcheck disable=SC1091
+          . /tmp/site/.deploy-info
+          # $deploy_dir_name is either "(root)" or a path like "editor".
+          echo "Deploying directory: $deploy_dir_name"
+          echo "  source subpath input: $subpath_input"
+          echo "  source sha:           $source_sha"
 
-          # Prepare an empty, orphaned branch with just our files.
-          TMP=$(mktemp -d)
-          cp -a /tmp/site/. "$TMP/"
-          cd "$TMP"
-          git init -q
+          # Fetch the current gh-pages branch (may not exist on first run).
+          git fetch origin gh-pages || true
+
+          # Create or check out gh-pages.
+          if git ls-remote --heads origin gh-pages | grep -q gh-pages; then
+              git checkout -B gh-pages origin/gh-pages
+          else
+              git checkout --orphan gh-pages
+          fi
+
+          # Remove the old version of the directory we're replacing, then
+          # copy in the freshly built one.
+          if [ "$deploy_dir_name" = "(root)" ]; then
+              # Preserve gh-pages metadata that isn't part of any build:
+              # the README table of deployed subpaths.
+              PRESERVED=""
+              for f in README.md; do
+                  if [ -f "$f" ]; then
+                      cp "$f" "/tmp/.preserved-$f"
+                      PRESERVED="$PRESERVED $f"
+                  fi
+              done
+              # Wipe everything tracked on gh-pages.
+              git ls-files | xargs -r rm -f
+              # Restore preserved files.
+              for f in $PRESERVED; do
+                  cp "/tmp/.preserved-$f" "$f"
+                  rm -f "/tmp/.preserved-$f"
+              done
+              # Copy the new build on top.
+              cp -a /tmp/site/. .
+              # Don't ship the sidecar file to Pages.
+              rm -f .deploy-info
+          else
+              rm -rf "$deploy_dir_name"
+              mkdir -p "$deploy_dir_name"
+              cp -a "/tmp/site/$deploy_dir_name/." "$deploy_dir_name/"
+              rm -f .deploy-info
+              # Also drop the sidecar if it ended up in the subdir.
+              rm -f "$deploy_dir_name/.deploy-info"
+          fi
+
+          # Update (or create) the gh-pages README that lists every deployed
+          # subpath and when it was last refreshed.
+          export deploy_dir_name subpath_input source_sha source_ref deployed_at
+          python3 - <<'PY'
+          import os, datetime, pathlib
+          deploy_dir = os.environ['deploy_dir_name']
+          subpath_input = os.environ['subpath_input']
+          source_sha = os.environ['source_sha']
+          source_ref = os.environ['source_ref']
+          deployed_at = os.environ['deployed_at']
+
+          ts = datetime.datetime.fromisoformat(deployed_at.replace('Z', '+00:00'))
+          ts_str = ts.strftime('%Y-%m-%d %H:%M:%S UTC')
+
+          readme = pathlib.Path('README.md')
+          marker = '<!-- begin deployments -->'
+          end_marker = '<!-- end deployments -->'
+
+          # Build the new row.
+          if deploy_dir == '(root)':
+              path_label = '/'
+              sub_label = '(whole site)'
+          else:
+              path_label = '/' + deploy_dir + '/'
+              sub_label = 'subpath: ' + (subpath_input or deploy_dir)
+          new_row = f'| {path_label} | {sub_label} | {ts_str} | `{source_sha[:7]}` |'
+
+          # Find existing table, if any.
+          text = readme.read_text() if readme.exists() else ''
+          if marker in text and end_marker in text:
+              head, _, tail = text.partition(marker)
+              # `tail` still contains the end_marker; split it off once.
+              body, _, _after = tail.partition(end_marker)
+              lines = [ln for ln in body.strip().splitlines() if ln.strip() and not ln.startswith('| ---')]
+              # De-dup by the first cell (the path).
+              seen = set()
+              kept = []
+              for ln in lines:
+                  key = ln.split('|', 2)[1].strip()
+                  if key == path_label.strip():
+                      continue
+                  if key in seen:
+                      continue
+                  seen.add(key)
+                  kept.append(ln)
+              kept.insert(0, new_row)
+              new_body = '\n' + '\n'.join(kept) + '\n'
+              text = head + marker + new_body + end_marker
+          else:
+              preamble = (
+                  '# gh-pages deployments\n\n'
+                  'This branch is published by the "Deploy to GitHub Pages" workflow.\n'
+                  'Each row below is one SvelteKit route that has been deployed.\n\n'
+              )
+              header = (
+                  '| Path | Source subpath | Last deployed | Source commit |\n'
+                  '| --- | --- | --- | --- |\n'
+              )
+              text = preamble + marker + '\n' + header + new_row + '\n' + end_marker + '\n'
+          readme.write_text(text)
+          PY
+
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git checkout -q --orphan gh-pages
           git add -A
 
-          # Pick a sensible commit message.
+          # If nothing actually changed, skip the commit/push.
+          if git diff --cached --quiet; then
+              echo "No changes to commit on gh-pages."
+              exit 0
+          fi
+
+          # Pick a commit message.
           if [ -n "${{ github.event.inputs.commit_message }}" ]; then
-            MSG="${{ github.event.inputs.commit_message }}"
+              MSG="${{ github.event.inputs.commit_message }}"
           else
-            MSG="deploy: ${{ github.sha }}"
+              MSG="deploy: $deploy_dir_name from $source_sha"
           fi
           git commit -q -m "$MSG"
 
-          # Force-push (this is gh-pages; we own it). Use the GITHUB_TOKEN
-          # the runner provides automatically.
           git push -f https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git gh-pages
 
       - name: Trigger Pages deployment
