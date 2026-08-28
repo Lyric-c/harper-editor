@@ -1,0 +1,172 @@
+name: Refresh vendored Harper code
+
+# Manually refreshes src/lib/harper-editor/ and src/lib/lint-framework/ from
+# the upstream Automattic/harper monorepo, applies the import-path rewrites,
+# then commits and pushes the result on a new branch.
+#
+# Run from the Actions tab → "Refresh vendored Harper code" → Run workflow.
+# By default it pulls the tip of Automattic/harper's `main` branch. You can
+# pin a specific commit by passing its SHA as the `upstream_ref` input.
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: 'Upstream git ref (branch / tag / SHA) to pull from'
+        required: false
+        default: 'main'
+      push_branch:
+        description: 'Branch to push the refresh commit to'
+        required: false
+        default: 'vendor/refresh'
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Check out this repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Clone upstream Harper
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${{ inputs.upstream_ref }}" \
+            https://github.com/Automattic/harper.git /tmp/harper
+          cd /tmp/harper
+          echo "upstream_commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "upstream_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "upstream_subject=$(git log -1 --format=%s)" >> "$GITHUB_OUTPUT"
+        id: upstream
+
+      - name: Stage new vendor copy
+        run: |
+          set -euo pipefail
+          SCRATCH=/tmp/harper-new
+          rm -rf "$SCRATCH"
+          mkdir -p "$SCRATCH/harper-editor" "$SCRATCH/lint-framework"
+
+          # 1) harper-editor: only the files we actually use
+          UPSTREAM=/tmp/harper
+          for f in Editor.svelte LazyEditor.svelte LintCard.svelte LintSidebar.svelte \
+                   StatusBar.svelte bundle.ts editorDisplay.ts index.ts styles.css types.ts; do
+              cp "$UPSTREAM/packages/harper-editor/src/lib/$f" \
+                 "$SCRATCH/harper-editor/"
+          done
+
+          # 2) lint-framework: entire src/ tree, flattened
+          cp -r "$UPSTREAM/packages/lint-framework/src/." "$SCRATCH/lint-framework/"
+
+          # Show the upstream rev for the commit message
+          echo "Upstream: $UPSTREAM_COMMIT" >&2
+
+      - name: Report diff (for the workflow log)
+        run: |
+          set -euo pipefail
+          {
+            echo "### Diff vs current vendor"
+            diff -ruN src/lib/harper-editor src/lib/lint-framework \
+                 /tmp/harper-new/harper-editor /tmp/harper-new/lint-framework \
+              | head -800 || true
+          } >> "$GITHUB_STEP_SUMMARY"
+        env:
+          UPSTREAM_COMMIT: ${{ steps.upstream.outputs.upstream_commit }}
+
+      - name: Overwrite vendor directories
+        run: |
+          set -euo pipefail
+          # Replace the contents of src/lib/harper-editor/ and
+          # src/lib/lint-framework/ with whatever we just staged in
+          # /tmp/harper-new, deleting any files that have been removed
+          # upstream. Done with `rm` + `cp` so we don't depend on rsync.
+          rm -rf src/lib/harper-editor
+          rm -rf src/lib/lint-framework
+          mkdir -p src/lib/harper-editor src/lib/lint-framework
+          cp -a /tmp/harper-new/harper-editor/. src/lib/harper-editor/
+          cp -a /tmp/harper-new/lint-framework/.  src/lib/lint-framework/
+
+      - name: Apply import-path rewrites
+        run: |
+          set -euo pipefail
+          cd src/lib/harper-editor
+          for f in *.svelte *.ts; do
+              sed -i \
+                -e "s|from 'lint-framework'|from '../lint-framework/index.js'|g" \
+                -e "s|from 'components'|from '../components/index.js'|g" \
+                "$f"
+          done
+          cd ../../..
+
+      - name: Verify no bare specifiers remain
+        run: |
+          set -euo pipefail
+          if grep -rn "from 'lint-framework'\|from 'components'" src/lib/harper-editor/; then
+            echo "::error::bare workspace specifiers still present in vendored harper-editor after rewrite"
+            exit 1
+          fi
+          echo "OK: no bare specifiers"
+
+      - name: Check package.json for new runtime deps
+        run: |
+          set -euo pipefail
+          # The upstream harper-editor package.json declares its dependencies;
+          # we want to be told if upstream gained new runtime deps we don't have.
+          echo "### Upstream harper-editor package.json"
+          cat /tmp/harper/packages/harper-editor/package.json
+          {
+            echo "### Upstream harper-editor package.json"
+            cat /tmp/harper/packages/harper-editor/package.json
+            echo ""
+            echo "### Our package.json (relevant deps)"
+            node -e "const p=require('./package.json'); console.log({...p.dependencies,...p.devDependencies});"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile=false
+
+      - name: Build (smoke test)
+        run: pnpm run build
+
+      - name: Push refresh branch
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          BRANCH="${{ inputs.push_branch }}"
+          UPSTREAM_COMMIT="${{ steps.upstream.outputs.upstream_commit }}"
+          UPSTREAM_SHORT="${{ steps.upstream.outputs.upstream_short }}"
+          UPSTREAM_SUBJECT="${{ steps.upstream.outputs.upstream_subject }}"
+
+          # Don't clobber an existing branch — fail loudly so the user can
+          # decide whether to delete it and re-run, or merge it first.
+          if git ls-remote --heads origin "$BRANCH" | grep -q "$BRANCH"; then
+              echo "::error::branch '$BRANCH' already exists on origin. Delete it or pick a different push_branch input."
+              exit 1
+          fi
+
+          git checkout -b "$BRANCH"
+          git add src/lib/harper-editor src/lib/lint-framework package.json pnpm-lock.yaml
+          # Only commit if there is actually a change.
+          if git diff --cached --quiet; then
+              echo "No changes to commit — vendor is already up to date with $UPSTREAM_SHORT."
+              exit 0
+          fi
+          git commit -m "vendor: refresh harper-editor + lint-framework from ${UPSTREAM_SHORT}" \
+                     -m "Upstream commit: ${UPSTREAM_COMMIT}" \
+                     -m "Subject: ${UPSTREAM_SUBJECT}"
+          git push -u origin "$BRANCH"
