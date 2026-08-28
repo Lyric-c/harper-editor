@@ -66,6 +66,14 @@ jobs:
   build:
     name: Build site
     runs-on: ubuntu-latest
+    # Outputs that the deploy job reads. GitHub Actions only forwards
+    # step-level outputs within the same job; to share values across
+    # jobs you must declare them here.
+    outputs:
+      subpath:  ${{ steps.subpath.outputs.subpath }}
+      base:     ${{ steps.subpath.outputs.base }}
+      deploy_dir: ${{ steps.subpath.outputs.deploy_dir }}
+      artifact: ${{ steps.subpath.outputs.artifact }}
     steps:
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -169,17 +177,18 @@ jobs:
       - name: Download artifact
         uses: actions/download-artifact@v4
         with:
-          name: ${{ steps.subpath.outputs.artifact }}
+          name: ${{ needs.build.outputs.artifact }}
           path: /tmp/site
 
       - name: Merge into gh-pages
         run: |
           set -euo pipefail
-          # Sidecar file written by the build job.
+          # Sidecar file written by the build job (mostly informational;
+          # the authoritative values are the job-level outputs from build).
           # shellcheck disable=SC1091
           . /tmp/site/.deploy-info 2>/dev/null || true
-          DEPLOY_DIR="${{ steps.subpath.outputs.deploy_dir }}"
-          BASE="${{ steps.subpath.outputs.base }}"
+          DEPLOY_DIR="${{ needs.build.outputs.deploy_dir }}"
+          BASE="${{ needs.build.outputs.base }}"
 
           echo "Deploying directory: $DEPLOY_DIR  (built with BASE='$BASE')"
 
