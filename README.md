@@ -7,7 +7,7 @@ your web server to copy the build/ contents into (so the
 BASE-prefixed asset URLs resolve correctly).
 
 <!-- begin deployments -->
+| / | (host root) | `(none)` | 2026-08-29 03:42:48 UTC | `b5da2a4` |
 | Serve at path | Source subpath | Built with base | Last deployed | Source commit |
-| --- | --- | --- | --- | --- |
 | /editor/ | subpath: editor | `/editor` | 2026-08-29 03:32:56 UTC | `6aca310` |
 <!-- end deployments -->
