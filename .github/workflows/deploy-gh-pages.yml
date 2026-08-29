@@ -98,8 +98,10 @@ jobs:
           RAW="${{ inputs.subpath }}"
           SUB=$(printf '%s' "$RAW" | sed -E 's#^/+##; s#/+$##; s#\s+##g')
           if [ -z "$SUB" ]; then
-            # Host root: no prefix on asset URLs.
-            BASE="/"
+            # Host root: empty string is the only valid form for
+            # SvelteKit's kit.paths.base when serving from "/". The
+            # resulting asset URLs are /_app/... (no prefix).
+            BASE=""
             ARTIFACT="site-root"
           else
             # SvelteKit requires kit.paths.base to start with "/" and NOT
