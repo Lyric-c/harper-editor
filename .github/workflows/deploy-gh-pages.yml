@@ -70,7 +70,6 @@ jobs:
     outputs:
       subpath:  ${{ steps.subpath.outputs.subpath }}
       base:     ${{ steps.subpath.outputs.base }}
-      deploy_dir: ${{ steps.subpath.outputs.deploy_dir }}
       artifact: ${{ steps.subpath.outputs.artifact }}
     steps:
       - name: Set up Node
@@ -101,20 +100,18 @@ jobs:
           if [ -z "$SUB" ]; then
             # Host root: no prefix on asset URLs.
             BASE="/"
-            DEPLOY_DIR="(root)"
             ARTIFACT="site-root"
           else
             # SvelteKit requires kit.paths.base to start with "/" and NOT
-            # end with one. We pass the prefix through BASE to the build.
+            # end with one. We pass the prefix through BASE to the build
+            # so every asset URL is rewritten with the prefix, and the
+            # resulting build/ can be dropped straight into a sub-path
+            # directory on your web server (e.g. /var/www/x/editor/).
             BASE="/$SUB"
-            # On the gh-pages branch we put the build under the same
-            # subpath so URLs match up at the host.
-            DEPLOY_DIR="$SUB"
             ARTIFACT="site-$(printf '%s' "$SUB" | tr '/' '-')"
           fi
           echo "subpath=$SUB"      >> "$GITHUB_OUTPUT"
           echo "base=$BASE"        >> "$GITHUB_OUTPUT"
-          echo "deploy_dir=$DEPLOY_DIR" >> "$GITHUB_OUTPUT"
           echo "artifact=$ARTIFACT" >> "$GITHUB_OUTPUT"
           echo "::notice::subpath='$SUB', built with BASE='$BASE'"
 
@@ -188,14 +185,10 @@ jobs:
       - name: Merge into gh-pages
         run: |
           set -euo pipefail
-          # Sidecar file written by the build job (mostly informational;
-          # the authoritative values are the job-level outputs from build).
-          # shellcheck disable=SC1091
-          . /tmp/site/.deploy-info 2>/dev/null || true
-          DEPLOY_DIR="${{ needs.build.outputs.deploy_dir }}"
           BASE="${{ needs.build.outputs.base }}"
+          SUBPATH_INPUT="${{ inputs.subpath }}"
 
-          echo "Deploying directory: $DEPLOY_DIR  (built with BASE='$BASE')"
+          echo "Built with BASE='$BASE' (subpath input: '$SUBPATH_INPUT')"
 
           # The working tree was checked out empty (sparse-checkout). Make
           # sure it really is empty in case some file slipped through.
@@ -204,12 +197,8 @@ jobs:
           git fetch origin gh-pages || true
 
           if git ls-remote --heads origin gh-pages | grep -q gh-pages; then
-              # Existing gh-pages: re-attach to it and incrementally update
-              # only the directory we're replacing. We pull its tree into
-              # the working copy first so we can read its README.
               git checkout -B gh-pages origin/gh-pages
           else
-              # First deploy ever: orphan branch starting from a clean tree.
               git checkout --orphan gh-pages
               # `git checkout --orphan` keeps the index but stages nothing;
               # wipe the index too so a stray `git add -A` later can't pick
@@ -217,7 +206,14 @@ jobs:
               git rm -rfq --cached . 2>/dev/null || true
           fi
 
-          # Preserve the gh-pages README that tracks every deployed subpath.
+          # The build always lands at the gh-pages branch root, regardless
+          # of which subpath the build was compiled for. The subpath is
+          # encoded in the asset URLs (via BASE) and recorded in the
+          # README on this branch; the operator is responsible for
+          # copying the build/ contents to the right sub-path on their
+          # web server (e.g. /var/www/x.com/editor/).
+
+          # Preserve the gh-pages README that records every deployment.
           PRESERVED=""
           for f in README.md; do
               if [ -f "$f" ]; then
@@ -225,39 +221,26 @@ jobs:
                   PRESERVED="$PRESERVED $f"
               fi
           done
-          # Wipe the previous version of the directory we're replacing.
-          if [ "$DEPLOY_DIR" = "(root)" ]; then
-              # Remove every tracked file on gh-pages — we are about to
-              # replace the lot with the freshly built site.
-              git ls-files | xargs -r rm -f
-          else
-              rm -rf "$DEPLOY_DIR"
-          fi
+          # Wipe every previously-tracked file on gh-pages.
+          git ls-files | xargs -r rm -f
           # Restore preserved files.
           for f in $PRESERVED; do
               cp "/tmp/.preserved-$f" "$f"
               rm -f "/tmp/.preserved-$f"
           done
 
-          # Copy the new build on top.
-          if [ "$DEPLOY_DIR" = "(root)" ]; then
-              cp -a /tmp/site/. .
-          else
-              mkdir -p "$DEPLOY_DIR"
-              cp -a /tmp/site/. "$DEPLOY_DIR/"
-          fi
+          # Copy the new build on top of the (now empty) working tree.
+          cp -a /tmp/site/. .
           rm -f .deploy-info
-          rm -f "$DEPLOY_DIR/.deploy-info"
 
           # Update the README table.
           SOURCE_SHA="${{ github.sha }}"
           SOURCE_REF="${{ github.ref }}"
           DEPLOYED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           SUBPATH_INPUT="${{ inputs.subpath }}"
-          export DEPLOY_DIR BASE SOURCE_SHA SOURCE_REF DEPLOYED_AT SUBPATH_INPUT
+          export BASE SOURCE_SHA SOURCE_REF DEPLOYED_AT SUBPATH_INPUT
           python3 - <<'PY'
           import os, datetime, pathlib
-          deploy_dir  = os.environ['DEPLOY_DIR']
           base        = os.environ['BASE']
           source_sha  = os.environ['SOURCE_SHA']
           source_ref  = os.environ['SOURCE_REF']
@@ -271,14 +254,14 @@ jobs:
           marker = '<!-- begin deployments -->'
           end_marker = '<!-- end deployments -->'
 
-          if deploy_dir == '(root)':
-              path_label = '/'
-              sub_label = '(host root)'
-              base_label = '(none)'
-          else:
-              path_label = '/' + deploy_dir + '/'
-              sub_label = 'subpath: ' + (sub_input or deploy_dir)
+          if sub_input:
+              path_label = '/' + sub_input + '/'
+              sub_label  = 'subpath: ' + sub_input
               base_label = base
+          else:
+              path_label = '/'
+              sub_label  = '(host root)'
+              base_label = '(none)'
 
           new_row = (
               f'| {path_label} | {sub_label} | `{base_label}` | {ts_str} | '
@@ -306,13 +289,14 @@ jobs:
           else:
               preamble = (
                   '# gh-pages deployments\n\n'
-                  'Each row below is one (subpath, base) combination that has '
-                  'been deployed. To serve one of these at a host, drop the '
-                  'matching sub-directory from the gh-pages branch into the '
-                  'corresponding path on your web server.\n\n'
+                  'Each row below is one deployment of the static site.\n'
+                  'The build/ contents always live at the root of the gh-pages\n'
+                  'branch. The "subpath" column tells you which sub-path on\n'
+                  'your web server to copy the build/ contents into (so the\n'
+                  'BASE-prefixed asset URLs resolve correctly).\n\n'
               )
               header = (
-                  '| Path | Source subpath | Built with base | Last deployed | Source commit |\n'
+                  '| Serve at path | Source subpath | Built with base | Last deployed | Source commit |\n'
                   '| --- | --- | --- | --- | --- |\n'
               )
               text = preamble + marker + '\n' + header + new_row + '\n' + end_marker + '\n'
@@ -331,7 +315,7 @@ jobs:
           if [ -n "${{ github.event.inputs.commit_message }}" ]; then
               MSG="${{ github.event.inputs.commit_message }}"
           else
-              MSG="deploy: $DEPLOY_DIR from $SOURCE_SHA"
+              MSG="deploy: BASE='$BASE' from $SOURCE_SHA"
           fi
           git commit -q -m "$MSG"
 
