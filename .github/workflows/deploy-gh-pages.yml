@@ -171,6 +171,13 @@ jobs:
           # We need history on the gh-pages branch so we can merge the new
           # subpath in without clobbering previously-deployed subpaths.
           fetch-depth: 0
+          # Do NOT check out the source tree. The deploy job must only ever
+          # produce the static-site build, never any of the repository
+          # source code. The 'sparse-checkout' settings below ensure that
+          # even on the first run (where the working tree would otherwise
+          # contain main's source files) we end up with an empty tree.
+          sparse-checkout: ''
+          sparse-checkout-cone-mode: false
 
       - name: Download artifact
         uses: actions/download-artifact@v4
@@ -190,12 +197,24 @@ jobs:
 
           echo "Deploying directory: $DEPLOY_DIR  (built with BASE='$BASE')"
 
+          # The working tree was checked out empty (sparse-checkout). Make
+          # sure it really is empty in case some file slipped through.
+          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+
           git fetch origin gh-pages || true
 
           if git ls-remote --heads origin gh-pages | grep -q gh-pages; then
+              # Existing gh-pages: re-attach to it and incrementally update
+              # only the directory we're replacing. We pull its tree into
+              # the working copy first so we can read its README.
               git checkout -B gh-pages origin/gh-pages
           else
+              # First deploy ever: orphan branch starting from a clean tree.
               git checkout --orphan gh-pages
+              # `git checkout --orphan` keeps the index but stages nothing;
+              # wipe the index too so a stray `git add -A` later can't pick
+              # up anything from the previous main checkout.
+              git rm -rfq --cached . 2>/dev/null || true
           fi
 
           # Preserve the gh-pages README that tracks every deployed subpath.
@@ -208,6 +227,8 @@ jobs:
           done
           # Wipe the previous version of the directory we're replacing.
           if [ "$DEPLOY_DIR" = "(root)" ]; then
+              # Remove every tracked file on gh-pages — we are about to
+              # replace the lot with the freshly built site.
               git ls-files | xargs -r rm -f
           else
               rm -rf "$DEPLOY_DIR"
